@@ -3,9 +3,20 @@
 import { useState, useEffect } from "react";
 import { ConnectButton, useAccesly } from "accesly";
 
+// Normaliza texto hablado (arroba -> @, punto -> .)
+function normalizeSpokenText(text: string): string {
+  return text
+    .replace(/\s+arroba\s+/gi, '@')
+    .replace(/\s+punto\s+/gi, '.')
+    .replace(/\s+at\s+/gi, '@')
+    .replace(/\s+dot\s+/gi, '.')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 // Extrae intent de transferencia del texto
 function extractTransferIntent(text: string) {
-  const normalized = text.toLowerCase();
+  const normalized = normalizeSpokenText(text.toLowerCase());
   
   const patterns = [
     /env[ií]a?\s+(\d+(?:\.\d+)?)\s+(?:lumens?|xlm|stellar)?\s*(?:a|to)\s+([^\s]+@[^\s]+)/i,
@@ -55,9 +66,10 @@ export default function Home() {
 
     recognition.onresult = async (event: any) => {
       const text = event.results[0][0].transcript;
-      setTranscript(text);
+      const normalizedText = normalizeSpokenText(text);
+      setTranscript(normalizedText);
       setListening(false);
-      await processCommand(text);
+      await processCommand(normalizedText);
     };
 
     recognition.onerror = (event: any) => {
