@@ -145,7 +145,8 @@ export default function Home() {
           .build();
 
         // 4. Firmar y enviar con Accesly
-        const { txHash } = await signAndSubmit(tx.toXDR());
+        const result = await signAndSubmit(tx.toXDR());
+        const txHash = result?.txHash || "unknown";
 
         setTxHistory(prev => [
           { text: `✅ ${intent.amount} XLM → ${intent.toEmail}`, hash: txHash },
