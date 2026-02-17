@@ -1,16 +1,22 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, Suspense } from "react";
+import dynamic from "next/dynamic";
 import { ConnectButton, useAccesly } from "accesly";
 import { createClient } from "@supabase/supabase-js";
 import { TransactionBuilder, Networks, Operation, Asset, Account, Memo } from "@stellar/stellar-sdk";
+
+// Cargar Three.js solo en cliente
+const GoyoOrb = dynamic(() => import("./GoyoOrb"), { 
+  ssr: false,
+  loading: () => <div className="w-full h-64 bg-zinc-900 rounded-xl animate-pulse" />
+});
 
 const supabase = createClient(
   "https://gbdlfmkenfldrjnzxqst.supabase.co",
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdiZGxmbWtlbmZsZHJqbnp4cXN0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA0OTU3MTgsImV4cCI6MjA4NjA3MTcxOH0.ymikUupRQrvbtzc7jEF3_ljUT4pmfc0JYG7Raqj9-sU"
 );
 
-// Estado global para controlar el flujo
 let isConversationActive = false;
 let recognition: any = null;
 
@@ -20,9 +26,7 @@ function speak(text: string, onEnd?: () => void) {
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = 'es-MX';
     utterance.rate = 1.1;
-    if (onEnd) {
-      utterance.onend = onEnd;
-    }
+    if (onEnd) utterance.onend = onEnd;
     window.speechSynthesis.speak(utterance);
   } else if (onEnd) {
     onEnd();
@@ -55,21 +59,21 @@ interface Contact {
   stellar_address: string;
 }
 
+type OrbState = "idle" | "listening" | "speaking" | "processing";
+
 export default function Home() {
   const { wallet, balance, signAndSubmit, loading } = useAccesly();
-  const [listening, setListening] = useState(false);
+  const [orbState, setOrbState] = useState<OrbState>("idle");
   const [conversationMode, setConversationMode] = useState(false);
-  const [status, setStatus] = useState("");
-  const [conversation, setConversation] = useState<{role: 'user' | 'goyo', text: string}[]>([]);
-  const [pendingTransfer, setPendingTransfer] = useState<{amount: number, toEmail: string, toAddress: string} | null>(null);
+  const [lastMessage, setLastMessage] = useState("");
   const [contacts, setContacts] = useState<Contact[]>([]);
+  const [pendingTransfer, setPendingTransfer] = useState<{amount: number, toEmail: string, toAddress: string} | null>(null);
   const [pendingAmount, setPendingAmount] = useState<number | null>(null);
-  const chatRef = useRef<HTMLDivElement>(null);
+  
   const pendingTransferRef = useRef(pendingTransfer);
   const pendingAmountRef = useRef(pendingAmount);
   const contactsRef = useRef(contacts);
 
-  // Mantener refs actualizados
   useEffect(() => { pendingTransferRef.current = pendingTransfer; }, [pendingTransfer]);
   useEffect(() => { pendingAmountRef.current = pendingAmount; }, [pendingAmount]);
   useEffect(() => { contactsRef.current = contacts; }, [contacts]);
@@ -80,22 +84,10 @@ export default function Home() {
         .from("wallets")
         .select("email, stellar_address")
         .limit(50);
-      if (data && data.length > 0) {
-        setContacts(data);
-      }
+      if (data && data.length > 0) setContacts(data);
     }
     loadContacts();
   }, []);
-
-  useEffect(() => {
-    if (chatRef.current) {
-      chatRef.current.scrollTop = chatRef.current.scrollHeight;
-    }
-  }, [conversation]);
-
-  const addMessage = (role: 'user' | 'goyo', text: string) => {
-    setConversation(prev => [...prev, { role, text }]);
-  };
 
   const findContact = (query: string): Contact | null => {
     const q = query.toLowerCase().replace(/[^a-z0-9@.]/g, '');
@@ -103,29 +95,23 @@ export default function Home() {
     
     let found = currentContacts.find(c => c.email.toLowerCase() === q);
     if (found) return found;
-
     found = currentContacts.find(c => c.email.split('@')[0].toLowerCase() === q);
     if (found) return found;
 
     let bestMatch: Contact | null = null;
     let bestScore = 0;
-    
     for (const contact of currentContacts) {
-      const username = contact.email.split('@')[0];
-      const score = fuzzyMatch(q, username);
+      const score = fuzzyMatch(q, contact.email.split('@')[0]);
       if (score > bestScore && score > 0.5) {
         bestScore = score;
         bestMatch = contact;
       }
     }
-    
     return bestMatch;
   };
 
   const startListening = () => {
-    if (!("webkitSpeechRecognition" in window) && !("SpeechRecognition" in window)) {
-      return;
-    }
+    if (!("webkitSpeechRecognition" in window) && !("SpeechRecognition" in window)) return;
 
     const SpeechRecognition = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
     recognition = new SpeechRecognition();
@@ -133,32 +119,18 @@ export default function Home() {
     recognition.continuous = false;
     recognition.interimResults = false;
 
-    recognition.onstart = () => {
-      setListening(true);
-      setStatus("🎤");
-    };
-
+    recognition.onstart = () => setOrbState("listening");
     recognition.onresult = async (event: any) => {
       const text = event.results[0][0].transcript;
-      setListening(false);
-      setStatus("");
       await processConversation(text);
     };
-
     recognition.onerror = () => {
-      setListening(false);
-      setStatus("");
-      // Reintentar si está en modo conversación
-      if (isConversationActive) {
-        setTimeout(() => startListening(), 500);
-      }
+      setOrbState("idle");
+      if (isConversationActive) setTimeout(() => startListening(), 500);
     };
-
     recognition.onend = () => {
-      setListening(false);
-      setStatus("");
+      if (orbState === "listening") setOrbState("idle");
     };
-
     recognition.start();
   };
 
@@ -167,8 +139,10 @@ export default function Home() {
     setConversationMode(true);
     const names = contacts.slice(0, 3).map(c => c.email.split('@')[0]).join(', ');
     const greeting = `¡Hola! Soy Goyo. Puedo enviar a ${names} y más. ¿Qué necesitas?`;
-    addMessage('goyo', greeting);
+    setLastMessage(greeting);
+    setOrbState("speaking");
     speak(greeting, () => {
+      setOrbState("idle");
       if (isConversationActive) startListening();
     });
   };
@@ -176,52 +150,47 @@ export default function Home() {
   const stopConversation = () => {
     isConversationActive = false;
     setConversationMode(false);
-    setListening(false);
+    setOrbState("idle");
     window.speechSynthesis.cancel();
-    if (recognition) {
-      try { recognition.stop(); } catch {}
-    }
-    setStatus("");
+    if (recognition) try { recognition.stop(); } catch {}
   };
 
   const respondAndListen = (text: string) => {
-    addMessage('goyo', text);
+    setLastMessage(text);
+    setOrbState("speaking");
     speak(text, () => {
-      if (isConversationActive) {
-        setTimeout(() => startListening(), 300);
-      }
+      setOrbState("idle");
+      if (isConversationActive) setTimeout(() => startListening(), 300);
     });
   };
 
   const processConversation = async (userText: string) => {
     const normalized = normalizeSpokenText(userText);
-    addMessage('user', normalized);
+    setLastMessage(`Tú: "${normalized}"`);
+    setOrbState("processing");
 
-    // Detectar "para" o "detente" o "adiós"
     if (/^(para|detente|stop|adiós|adios|bye|chao|termina)/i.test(normalized)) {
       stopConversation();
-      addMessage('goyo', "¡Hasta luego!");
-      speak("¡Hasta luego!");
+      setLastMessage("¡Hasta luego!");
+      setOrbState("speaking");
+      speak("¡Hasta luego!", () => setOrbState("idle"));
       return;
     }
 
     const currentPending = pendingTransferRef.current;
     const currentAmount = pendingAmountRef.current;
 
-    // Confirmación
-    if (currentPending && /^(sí|si|yes|ok|confirma|dale|va|hazlo|claro|adelante|afirmativo)/i.test(normalized)) {
+    if (currentPending && /^(sí|si|yes|ok|confirma|dale|va|hazlo|claro|adelante)/i.test(normalized)) {
       await executeTransfer();
       return;
     }
 
-    // Cancelación
-    if (currentPending && /^(no|cancela|olvídalo|mejor no|nel|negativo)/i.test(normalized)) {
+    if (currentPending && /^(no|cancela|olvídalo|mejor no|nel)/i.test(normalized)) {
       setPendingTransfer(null);
       respondAndListen("Cancelado. ¿Qué más?");
       return;
     }
 
-    // Si hay monto pendiente y dice un nombre
     if (currentAmount && !normalized.match(/\d+/)) {
       const contact = findContact(normalized);
       if (contact) {
@@ -232,39 +201,30 @@ export default function Home() {
       }
     }
 
-    // Listar contactos
-    if (/lista|contactos|quién|quiénes|opciones/i.test(normalized)) {
-      const names = contactsRef.current.slice(0, 6).map(c => c.email.split('@')[0]).join(', ');
-      respondAndListen(`Tengo: ${names}. ¿A quién le envío?`);
+    if (/lista|contactos|quién|quiénes/i.test(normalized)) {
+      const names = contactsRef.current.slice(0, 5).map(c => c.email.split('@')[0]).join(', ');
+      respondAndListen(`Tengo: ${names}. ¿A quién?`);
       return;
     }
 
-    // Detectar monto
     const amountMatch = normalized.match(/(\d+(?:\.\d+)?)/);
     const amount = amountMatch ? parseFloat(amountMatch[1]) : null;
 
-    // Buscar nombre
     const words = normalized.split(/\s+/);
     let foundContact: Contact | null = null;
-    
     for (const word of words) {
-      if (word.length > 2 && !/^\d+$/.test(word) && !['envía', 'envia', 'manda', 'lumens', 'lumen', 'xlm', 'a', 'para'].includes(word.toLowerCase())) {
+      if (word.length > 2 && !/^\d+$/.test(word) && !['envía', 'envia', 'manda', 'lumens', 'lumen', 'xlm', 'a'].includes(word.toLowerCase())) {
         const contact = findContact(word);
-        if (contact) {
-          foundContact = contact;
-          break;
-        }
+        if (contact) { foundContact = contact; break; }
       }
     }
 
-    // Monto y contacto
     if (amount && foundContact) {
       setPendingTransfer({ amount, toEmail: foundContact.email, toAddress: foundContact.stellar_address });
-      respondAndListen(`¿${amount} lumens a ${foundContact.email.split('@')[0]}? Di sí para enviar.`);
+      respondAndListen(`¿${amount} lumens a ${foundContact.email.split('@')[0]}? Di sí.`);
       return;
     }
 
-    // Solo monto
     if (amount && !foundContact) {
       setPendingAmount(amount);
       const names = contactsRef.current.slice(0, 3).map(c => c.email.split('@')[0]).join(', ');
@@ -272,15 +232,13 @@ export default function Home() {
       return;
     }
 
-    // Solo nombre
     if (foundContact && !amount) {
       respondAndListen(`${foundContact.email.split('@')[0]}, ¿cuántos lumens?`);
       return;
     }
 
-    // No entendió
     const firstName = contactsRef.current[0]?.email.split('@')[0] || 'alguien';
-    respondAndListen(`Di algo como: 50 lumens a ${firstName}. O di lista para ver contactos.`);
+    respondAndListen(`Di: 50 lumens a ${firstName}`);
   };
 
   const executeTransfer = async () => {
@@ -288,12 +246,10 @@ export default function Home() {
     if (!transfer || !wallet) return;
 
     try {
-      setStatus("💸");
+      setOrbState("processing");
       speak("Enviando...");
 
-      const res = await fetch(
-        `https://horizon-testnet.stellar.org/accounts/${wallet.stellarAddress}`
-      );
+      const res = await fetch(`https://horizon-testnet.stellar.org/accounts/${wallet.stellarAddress}`);
       const accountData = await res.json();
       const account = new Account(wallet.stellarAddress!, accountData.sequence);
 
@@ -301,93 +257,77 @@ export default function Home() {
         fee: "100",
         networkPassphrase: Networks.TESTNET,
       })
-        .addOperation(
-          Operation.payment({
-            destination: transfer.toAddress,
-            asset: Asset.native(),
-            amount: transfer.amount.toString(),
-          })
-        )
+        .addOperation(Operation.payment({
+          destination: transfer.toAddress,
+          asset: Asset.native(),
+          amount: transfer.amount.toString(),
+        }))
         .addMemo(Memo.text("Goyo"))
         .setTimeout(60)
         .build();
 
       await signAndSubmit(tx.toXDR());
-
       setPendingTransfer(null);
-      setStatus("✅");
       respondAndListen(`¡Listo! Envié ${transfer.amount} lumens a ${transfer.toEmail.split('@')[0]}. ¿Algo más?`);
 
     } catch (error: any) {
-      setStatus("");
       setPendingTransfer(null);
-      respondAndListen(`Error: ${error.message}. ¿Intentamos de nuevo?`);
+      respondAndListen(`Error: ${error.message}. ¿Otra vez?`);
     }
   };
 
   return (
-    <div className="h-screen bg-black text-white flex flex-col">
+    <div className="min-h-screen bg-gradient-to-b from-black via-zinc-900 to-black text-white flex flex-col">
       {/* Header */}
-      <div className="p-3 border-b border-zinc-800 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <h1 className="text-xl font-bold">🎙️ Goyo</h1>
-          {conversationMode && (
-            <span className="text-xs bg-green-600 px-2 py-1 rounded-full animate-pulse">
-              LIVE
-            </span>
-          )}
-        </div>
+      <div className="p-4 flex items-center justify-between">
+        <h1 className="text-2xl font-bold bg-gradient-to-r from-purple-400 to-pink-500 bg-clip-text text-transparent">
+          GOYO 2.0
+        </h1>
         <ConnectButton />
       </div>
 
+      {/* Balance */}
       {wallet && (
-        <div className="px-3 py-2 text-sm text-zinc-400 border-b border-zinc-800">
+        <div className="text-center text-zinc-400 text-sm">
           {balance || "0"} XLM
         </div>
       )}
 
-      {/* Chat */}
-      <div ref={chatRef} className="flex-1 overflow-y-auto p-3 space-y-3 pb-32">
-        {!wallet && (
-          <div className="text-center text-zinc-500 py-8">
-            <p className="text-lg mb-2">👆 Conecta tu wallet</p>
-          </div>
-        )}
-        
-        {conversation.map((msg, i) => (
-          <div 
-            key={i} 
-            className={`p-3 rounded-2xl max-w-[85%] ${
-              msg.role === 'user' 
-                ? 'bg-blue-600 ml-auto' 
-                : 'bg-zinc-800'
-            }`}
-          >
-            {msg.role === 'goyo' && <p className="text-xs text-zinc-400 mb-1">🤖 Goyo</p>}
-            <p className="text-sm">{msg.text}</p>
-          </div>
-        ))}
-
-        {listening && (
+      {/* Orbe 3D */}
+      <div className="flex-1 flex flex-col items-center justify-center px-4">
+        {wallet ? (
+          <>
+            <Suspense fallback={<div className="w-full h-64 bg-zinc-900 rounded-xl" />}>
+              <GoyoOrb state={orbState} />
+            </Suspense>
+            
+            {/* Último mensaje */}
+            <div className="mt-4 text-center max-w-sm">
+              <p className="text-lg text-zinc-300">{lastMessage}</p>
+            </div>
+          </>
+        ) : (
           <div className="text-center">
-            <span className="inline-block w-4 h-4 bg-red-500 rounded-full animate-pulse"></span>
-            <p className="text-xs text-zinc-500 mt-1">Escuchando...</p>
+            <div className="w-32 h-32 rounded-full bg-zinc-800 mx-auto mb-4 flex items-center justify-center">
+              <span className="text-5xl">🎙️</span>
+            </div>
+            <p className="text-zinc-500">Conecta tu wallet para empezar</p>
           </div>
         )}
       </div>
 
       {/* Contactos rápidos */}
       {wallet && contacts.length > 0 && !conversationMode && (
-        <div className="px-3 pb-2 border-t border-zinc-800 pt-2">
-          <div className="flex gap-2 overflow-x-auto">
-            {contacts.slice(0, 5).map(contact => (
+        <div className="px-4 pb-2">
+          <div className="flex gap-2 overflow-x-auto pb-2 justify-center">
+            {contacts.slice(0, 4).map(contact => (
               <button
                 key={contact.email}
                 onClick={() => {
-                  if (!conversationMode) startConversation();
-                  setTimeout(() => processConversation(`10 lumens a ${contact.email.split('@')[0]}`), 1000);
+                  startConversation();
+                  setTimeout(() => processConversation(`10 lumens a ${contact.email.split('@')[0]}`), 1500);
                 }}
-                className="bg-zinc-800 px-3 py-2 rounded-full text-xs whitespace-nowrap"
+                className="bg-zinc-800/50 backdrop-blur px-4 py-2 rounded-full text-sm border border-zinc-700 hover:border-purple-500 transition"
               >
                 {contact.email.split('@')[0]}
               </button>
@@ -398,21 +338,21 @@ export default function Home() {
 
       {/* Botón principal */}
       {wallet && (
-        <div className="p-3 border-t border-zinc-800 bg-black">
+        <div className="p-4 pb-8">
           {!conversationMode ? (
             <button
               onClick={startConversation}
               disabled={loading || contacts.length === 0}
-              className="w-full py-5 rounded-2xl text-lg font-bold bg-green-600 active:scale-95 transition-transform"
+              className="w-full py-5 rounded-2xl text-lg font-bold bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 active:scale-95 transition-all shadow-lg shadow-purple-500/25"
             >
               🎤 Iniciar conversación
             </button>
           ) : (
             <button
               onClick={stopConversation}
-              className="w-full py-5 rounded-2xl text-lg font-bold bg-red-600 active:scale-95 transition-transform"
+              className="w-full py-5 rounded-2xl text-lg font-bold bg-red-600 hover:bg-red-500 active:scale-95 transition-all"
             >
-              ⏹️ Terminar conversación
+              ⏹️ Terminar
             </button>
           )}
         </div>
