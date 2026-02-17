@@ -1,9 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { ConnectButton, useAccesly } from "accesly";
 import { createClient } from "@supabase/supabase-js";
-import { TransactionBuilder, Networks, Operation, Asset, Account } from "@stellar/stellar-sdk";
+import { TransactionBuilder, Networks, Operation, Asset, Account, Memo } from "@stellar/stellar-sdk";
 
 // Supabase client
 const supabase = createClient(
@@ -11,7 +11,18 @@ const supabase = createClient(
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdiZGxmbWtlbmZsZHJqbnp4cXN0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA0OTU3MTgsImV4cCI6MjA4NjA3MTcxOH0.ymikUupRQrvbtzc7jEF3_ljUT4pmfc0JYG7Raqj9-sU"
 );
 
-// Normaliza texto hablado (arroba -> @, punto -> .)
+// TTS - Hablar
+function speak(text: string) {
+  if ('speechSynthesis' in window) {
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = 'es-MX';
+    utterance.rate = 1.1;
+    window.speechSynthesis.speak(utterance);
+  }
+}
+
+// Normaliza texto hablado
 function normalizeSpokenText(text: string): string {
   return text
     .replace(/\s+arroba\s+/gi, '@')
@@ -22,41 +33,34 @@ function normalizeSpokenText(text: string): string {
     .trim();
 }
 
-// Extrae intent de transferencia del texto
-function extractTransferIntent(text: string) {
-  const normalized = normalizeSpokenText(text.toLowerCase());
-  
-  const patterns = [
-    /env[ií]a?\s+(\d+(?:\.\d+)?)\s+(?:lumens?|xlm|stellar)?\s*(?:a|to)\s+([^\s]+@[^\s]+)/i,
-    /transfer(?:ir)?\s+(\d+(?:\.\d+)?)\s+(?:lumens?|xlm)?\s*(?:a|to)\s+([^\s]+@[^\s]+)/i,
-    /manda\s+(\d+(?:\.\d+)?)\s+(?:lumens?|xlm|stellar)?\s*a\s+([^\s]+@[^\s]+)/i,
-    /send\s+(\d+(?:\.\d+)?)\s+(?:lumens?|xlm)?\s*to\s+([^\s]+@[^\s]+)/i,
-  ];
-
-  for (const pattern of patterns) {
-    const match = normalized.match(pattern);
-    if (match) {
-      return {
-        type: "transfer" as const,
-        amount: parseFloat(match[1]),
-        toEmail: match[2].toLowerCase(),
-      };
-    }
-  }
-
-  return { type: "unknown" as const };
-}
-
-// Busca stellar address por email en Supabase
+// Busca stellar address por email
 async function getAddressByEmail(email: string): Promise<string | null> {
   const { data, error } = await supabase
     .from("wallets")
     .select("stellar_address")
     .eq("email", email)
     .single();
-  
   if (error || !data) return null;
   return data.stellar_address;
+}
+
+// Busca emails similares
+async function searchEmails(query: string): Promise<string[]> {
+  const { data } = await supabase
+    .from("wallets")
+    .select("email")
+    .ilike("email", `%${query}%`)
+    .limit(5);
+  return data?.map(d => d.email) || [];
+}
+
+// Obtiene todos los emails
+async function getAllEmails(): Promise<string[]> {
+  const { data } = await supabase
+    .from("wallets")
+    .select("email")
+    .limit(20);
+  return data?.map(d => d.email) || [];
 }
 
 export default function Home() {
@@ -64,12 +68,31 @@ export default function Home() {
   const [listening, setListening] = useState(false);
   const [transcript, setTranscript] = useState("");
   const [status, setStatus] = useState("");
-  const [txHistory, setTxHistory] = useState<{text: string, hash?: string}[]>([]);
+  const [conversation, setConversation] = useState<{role: 'user' | 'goyo', text: string}[]>([]);
+  const [pendingTransfer, setPendingTransfer] = useState<{amount: number, toEmail: string, toAddress: string} | null>(null);
+  const [availableEmails, setAvailableEmails] = useState<string[]>([]);
 
-  // Web Speech API
+  // Cargar emails al inicio
+  useEffect(() => {
+    getAllEmails().then(setAvailableEmails);
+  }, []);
+
+  // Saludo inicial
+  useEffect(() => {
+    if (wallet && conversation.length === 0) {
+      const greeting = `¡Hola! Soy Goyo, tu asistente de pagos. Puedes decirme cosas como: envía 10 lumens a un correo. ¿A quién quieres enviar?`;
+      addMessage('goyo', greeting);
+      speak(greeting);
+    }
+  }, [wallet]);
+
+  const addMessage = (role: 'user' | 'goyo', text: string) => {
+    setConversation(prev => [...prev, { role, text }]);
+  };
+
   const startListening = () => {
     if (!("webkitSpeechRecognition" in window)) {
-      setStatus("⚠️ Tu navegador no soporta reconocimiento de voz");
+      speak("Tu navegador no soporta voz");
       return;
     }
 
@@ -86,176 +109,227 @@ export default function Home() {
 
     recognition.onresult = async (event: any) => {
       const text = event.results[0][0].transcript;
-      const normalizedText = normalizeSpokenText(text);
-      setTranscript(normalizedText);
       setListening(false);
-      await processCommand(normalizedText);
+      await processConversation(text);
     };
 
-    recognition.onerror = (event: any) => {
-      setStatus(`❌ Error: ${event.error}`);
-      setListening(false);
-    };
-
-    recognition.onend = () => {
-      setListening(false);
-    };
-
+    recognition.onerror = () => setListening(false);
+    recognition.onend = () => setListening(false);
     recognition.start();
   };
 
-  const processCommand = async (text: string) => {
-    setStatus("🔄 Procesando...");
-    const intent = extractTransferIntent(text);
+  const processConversation = async (userText: string) => {
+    const normalized = normalizeSpokenText(userText);
+    addMessage('user', normalized);
+    setTranscript(normalized);
 
-    if (intent.type === "transfer" && wallet) {
-      try {
-        // 1. Buscar dirección del destinatario en Supabase
-        setStatus(`🔍 Buscando ${intent.toEmail}...`);
-        const destinationAddress = await getAddressByEmail(intent.toEmail);
-        
-        if (!destinationAddress) {
-          setStatus(`❌ No encontré wallet para ${intent.toEmail}`);
-          return;
-        }
+    // Detectar confirmación
+    if (pendingTransfer && /^(sí|si|yes|ok|confirma|dale|va|hazlo)/i.test(normalized)) {
+      await executeTransfer();
+      return;
+    }
 
-        setStatus(`💸 Enviando ${intent.amount} XLM a ${intent.toEmail}...`);
+    // Detectar cancelación
+    if (pendingTransfer && /^(no|cancela|olvídalo|mejor no)/i.test(normalized)) {
+      setPendingTransfer(null);
+      const msg = "Ok, cancelado. ¿Qué más necesitas?";
+      addMessage('goyo', msg);
+      speak(msg);
+      return;
+    }
 
-        // 2. Obtener cuenta del remitente desde Horizon
-        const res = await fetch(
-          `https://horizon-testnet.stellar.org/accounts/${wallet.stellarAddress}`
-        );
-        const accountData = await res.json();
-        const account = new Account(wallet.stellarAddress!, accountData.sequence);
+    // Detectar "listar contactos"
+    if (/lista|contactos|correos|emails|quién|a quién/i.test(normalized)) {
+      const names = availableEmails.slice(0, 5).map(e => e.split('@')[0]).join(', ');
+      const msg = `Tengo estos contactos: ${names}. ¿A cuál quieres enviar?`;
+      addMessage('goyo', msg);
+      speak(msg);
+      return;
+    }
 
-        // 3. Construir transacción
-        const tx = new TransactionBuilder(account, {
-          fee: "100",
-          networkPassphrase: Networks.TESTNET,
-        })
-          .addOperation(
-            Operation.payment({
-              destination: destinationAddress,
-              asset: Asset.native(),
-              amount: intent.amount.toString(),
-            })
-          )
-          .addMemo(new (await import("@stellar/stellar-sdk")).Memo("text", `Goyo: ${intent.toEmail}`))
-          .setTimeout(60)
-          .build();
+    // Detectar transferencia
+    const transferMatch = normalized.match(/(?:env[ií]a?|manda|transfer)\s+(\d+(?:\.\d+)?)\s*(?:lumens?|xlm)?\s*(?:a\s+)?([^\s]+@[^\s]+)?/i);
+    
+    if (transferMatch) {
+      const amount = parseFloat(transferMatch[1]);
+      let toEmail = transferMatch[2]?.toLowerCase();
 
-        // 4. Firmar y enviar con Accesly
-        const result = await signAndSubmit(tx.toXDR());
-        const txHash = result?.txHash || "unknown";
-
-        setTxHistory(prev => [
-          { text: `✅ ${intent.amount} XLM → ${intent.toEmail}`, hash: txHash },
-          ...prev
-        ]);
-        setStatus(`✅ Enviado! TX: ${txHash.slice(0, 8)}...`);
-
-      } catch (error: any) {
-        console.error(error);
-        setStatus(`❌ Error: ${error.message}`);
+      // Si no hay email, preguntar
+      if (!toEmail) {
+        const msg = `¿${amount} lumens a quién? Dime el correo o el nombre.`;
+        addMessage('goyo', msg);
+        speak(msg);
+        return;
       }
-    } else if (intent.type === "transfer" && !wallet) {
-      setStatus("⚠️ Conecta tu wallet primero");
-    } else {
-      setStatus("🤷 No entendí. Prueba: 'envía 10 lumens a email@test.com'");
+
+      // Buscar en DB
+      setStatus("🔍 Buscando...");
+      let address = await getAddressByEmail(toEmail);
+
+      // Si no encontró, buscar similar
+      if (!address) {
+        const similar = await searchEmails(toEmail.split('@')[0]);
+        if (similar.length > 0) {
+          toEmail = similar[0];
+          address = await getAddressByEmail(toEmail);
+        }
+      }
+
+      if (!address) {
+        const msg = `No encontré a ${toEmail} en la base de datos. ¿Quieres intentar con otro correo?`;
+        addMessage('goyo', msg);
+        speak(msg);
+        return;
+      }
+
+      // Pedir confirmación
+      setPendingTransfer({ amount, toEmail, toAddress: address });
+      const shortAddr = address.slice(0, 8);
+      const msg = `Voy a enviar ${amount} lumens a ${toEmail}. Su wallet es ${shortAddr}... ¿Confirmas?`;
+      addMessage('goyo', msg);
+      speak(msg);
+      return;
+    }
+
+    // Detectar solo nombre/email
+    const emailMatch = normalized.match(/([^\s]+@[^\s]+)/i);
+    const nameMatch = normalized.match(/(?:a\s+)?(\w+)/i);
+    
+    if (emailMatch || nameMatch) {
+      const query = emailMatch ? emailMatch[1] : nameMatch![1];
+      const results = await searchEmails(query);
+      
+      if (results.length > 0) {
+        const msg = `Encontré a ${results[0]}. ¿Cuántos lumens quieres enviarle?`;
+        addMessage('goyo', msg);
+        speak(msg);
+        return;
+      }
+    }
+
+    // No entendió
+    const msg = "No entendí. Puedes decir: envía 50 lumens a correo@ejemplo.com, o pregúntame quiénes están en la lista.";
+    addMessage('goyo', msg);
+    speak(msg);
+  };
+
+  const executeTransfer = async () => {
+    if (!pendingTransfer || !wallet) return;
+
+    try {
+      setStatus("💸 Enviando...");
+      speak("Enviando...");
+
+      // Obtener cuenta
+      const res = await fetch(
+        `https://horizon-testnet.stellar.org/accounts/${wallet.stellarAddress}`
+      );
+      const accountData = await res.json();
+      const account = new Account(wallet.stellarAddress!, accountData.sequence);
+
+      // Construir TX
+      const tx = new TransactionBuilder(account, {
+        fee: "100",
+        networkPassphrase: Networks.TESTNET,
+      })
+        .addOperation(
+          Operation.payment({
+            destination: pendingTransfer.toAddress,
+            asset: Asset.native(),
+            amount: pendingTransfer.amount.toString(),
+          })
+        )
+        .addMemo(Memo.text("Goyo"))
+        .setTimeout(60)
+        .build();
+
+      // Firmar y enviar
+      const result = await signAndSubmit(tx.toXDR());
+      const txHash = result?.txHash || "completado";
+
+      const msg = `¡Listo! Envié ${pendingTransfer.amount} lumens a ${pendingTransfer.toEmail}. La transacción fue exitosa. ¿Algo más?`;
+      addMessage('goyo', msg);
+      speak(msg);
+      setStatus(`✅ TX: ${txHash.slice(0, 8)}...`);
+      setPendingTransfer(null);
+
+    } catch (error: any) {
+      const msg = `Hubo un error: ${error.message}. ¿Quieres intentar de nuevo?`;
+      addMessage('goyo', msg);
+      speak(msg);
+      setPendingTransfer(null);
     }
   };
 
   return (
-    <div className="min-h-screen bg-black text-white flex flex-col items-center justify-center p-8">
-      <main className="max-w-lg w-full space-y-8">
-        {/* Header */}
-        <div className="text-center">
-          <h1 className="text-4xl font-bold mb-2">🎙️ Goyo 2.0</h1>
-          <p className="text-zinc-400">Envía Stellar tokens por voz</p>
+    <div className="min-h-screen bg-black text-white flex flex-col p-4">
+      {/* Header */}
+      <div className="text-center py-4">
+        <h1 className="text-2xl font-bold">🎙️ Goyo 2.0</h1>
+        <ConnectButton />
+      </div>
+
+      {/* Wallet Info */}
+      {wallet && (
+        <div className="bg-zinc-900 rounded-lg p-3 mb-4 text-sm">
+          <p className="text-zinc-400">{wallet.email}</p>
+          <p className="text-xl font-bold">{balance || "0"} XLM</p>
         </div>
+      )}
 
-        {/* Wallet Connection */}
-        <div className="flex justify-center">
-          <ConnectButton />
-        </div>
-
-        {/* Wallet Info */}
-        {wallet && (
-          <div className="bg-zinc-900 rounded-xl p-4 space-y-2">
-            <p className="text-sm text-zinc-400">Conectado como</p>
-            <p className="font-mono text-sm truncate">{wallet.email}</p>
-            <p className="text-2xl font-bold">{balance || "0"} XLM</p>
-            <p className="text-xs text-zinc-500 truncate">{wallet.stellarAddress}</p>
-          </div>
-        )}
-
-        {/* Voice Input */}
-        {wallet && (
-          <div className="space-y-4">
-            <button
-              onClick={startListening}
-              disabled={listening || loading}
-              className={`w-full py-6 rounded-xl text-xl font-semibold transition-all ${
-                listening
-                  ? "bg-red-600 animate-pulse"
-                  : "bg-white text-black hover:bg-zinc-200"
-              }`}
-            >
-              {listening ? "🎤 Escuchando..." : "🎤 Hablar"}
-            </button>
-
-            {/* Transcript */}
-            {transcript && (
-              <div className="bg-zinc-800 rounded-lg p-4">
-                <p className="text-sm text-zinc-400 mb-1">Escuché:</p>
-                <p className="text-lg">&quot;{transcript}&quot;</p>
-              </div>
-            )}
-
-            {/* Status */}
-            {status && (
-              <p className="text-center text-lg">{status}</p>
-            )}
-
-            {/* History */}
-            {txHistory.length > 0 && (
-              <div className="space-y-2">
-                <p className="text-sm text-zinc-400">Historial:</p>
-                {txHistory.map((tx, i) => (
-                  <div key={i} className="bg-zinc-900 rounded-lg p-3 text-sm">
-                    <p>{tx.text}</p>
-                    {tx.hash && (
-                      <a 
-                        href={`https://stellar.expert/explorer/testnet/tx/${tx.hash}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-blue-400 text-xs hover:underline"
-                      >
-                        Ver en Explorer →
-                      </a>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Instructions */}
-        {!wallet && (
-          <div className="text-center text-zinc-500">
-            <p>Conecta tu wallet para empezar</p>
-            <p className="text-sm mt-2">
-              Di: &quot;envía 50 lumens a juan arroba test punto com&quot;
+      {/* Conversation */}
+      <div className="flex-1 overflow-y-auto space-y-3 mb-4">
+        {conversation.map((msg, i) => (
+          <div 
+            key={i} 
+            className={`p-3 rounded-lg max-w-[85%] ${
+              msg.role === 'user' 
+                ? 'bg-blue-600 ml-auto' 
+                : 'bg-zinc-800'
+            }`}
+          >
+            <p className="text-xs text-zinc-400 mb-1">
+              {msg.role === 'user' ? 'Tú' : '🤖 Goyo'}
             </p>
+            <p>{msg.text}</p>
           </div>
-        )}
-      </main>
+        ))}
+      </div>
 
-      {/* Footer */}
-      <footer className="mt-16 text-center text-zinc-600 text-sm">
-        <p>Stellar Testnet • Accesly + Supabase</p>
-      </footer>
+      {/* Status */}
+      {status && (
+        <p className="text-center text-sm text-zinc-400 mb-2">{status}</p>
+      )}
+
+      {/* Voice Button */}
+      {wallet && (
+        <button
+          onClick={startListening}
+          disabled={listening || loading}
+          className={`w-full py-6 rounded-xl text-xl font-bold transition-all ${
+            listening
+              ? "bg-red-600 animate-pulse"
+              : "bg-white text-black"
+          }`}
+        >
+          {listening ? "🎤 Escuchando..." : "🎤 Hablar con Goyo"}
+        </button>
+      )}
+
+      {/* Quick actions */}
+      {wallet && availableEmails.length > 0 && (
+        <div className="mt-4 flex flex-wrap gap-2">
+          {availableEmails.slice(0, 4).map(email => (
+            <button
+              key={email}
+              onClick={() => processConversation(`envía 10 lumens a ${email}`)}
+              className="bg-zinc-800 px-3 py-2 rounded-lg text-xs"
+            >
+              {email.split('@')[0]}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
