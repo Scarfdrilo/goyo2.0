@@ -1,7 +1,15 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { ConnectButton, useAccesly } from "accesly";
+import { createClient } from "@supabase/supabase-js";
+import { TransactionBuilder, Networks, Operation, Asset, Account } from "@stellar/stellar-sdk";
+
+// Supabase client
+const supabase = createClient(
+  "https://gbdlfmkenfldrjnzxqst.supabase.co",
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdiZGxmbWtlbmZsZHJqbnp4cXN0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA0OTU3MTgsImV4cCI6MjA4NjA3MTcxOH0.ymikUupRQrvbtzc7jEF3_ljUT4pmfc0JYG7Raqj9-sU"
+);
 
 // Normaliza texto hablado (arroba -> @, punto -> .)
 function normalizeSpokenText(text: string): string {
@@ -39,12 +47,24 @@ function extractTransferIntent(text: string) {
   return { type: "unknown" as const };
 }
 
+// Busca stellar address por email en Supabase
+async function getAddressByEmail(email: string): Promise<string | null> {
+  const { data, error } = await supabase
+    .from("wallets")
+    .select("stellar_address")
+    .eq("email", email)
+    .single();
+  
+  if (error || !data) return null;
+  return data.stellar_address;
+}
+
 export default function Home() {
-  const { wallet, balance, sendPayment, loading } = useAccesly();
+  const { wallet, balance, signAndSubmit, loading } = useAccesly();
   const [listening, setListening] = useState(false);
   const [transcript, setTranscript] = useState("");
   const [status, setStatus] = useState("");
-  const [txHistory, setTxHistory] = useState<string[]>([]);
+  const [txHistory, setTxHistory] = useState<{text: string, hash?: string}[]>([]);
 
   // Web Speech API
   const startListening = () => {
@@ -88,29 +108,57 @@ export default function Home() {
     setStatus("🔄 Procesando...");
     const intent = extractTransferIntent(text);
 
-    if (intent.type === "transfer") {
+    if (intent.type === "transfer" && wallet) {
       try {
-        // Por ahora usamos la dirección del destinatario
-        // En prod, resolveríamos email -> stellar address via Accesly
-        setStatus(`💸 Enviando ${intent.amount} XLM a ${intent.toEmail}...`);
+        // 1. Buscar dirección del destinatario en Supabase
+        setStatus(`🔍 Buscando ${intent.toEmail}...`);
+        const destinationAddress = await getAddressByEmail(intent.toEmail);
         
-        // TODO: Resolver email a stellar address
-        // Por ahora mostramos el intent
+        if (!destinationAddress) {
+          setStatus(`❌ No encontré wallet para ${intent.toEmail}`);
+          return;
+        }
+
+        setStatus(`💸 Enviando ${intent.amount} XLM a ${intent.toEmail}...`);
+
+        // 2. Obtener cuenta del remitente desde Horizon
+        const res = await fetch(
+          `https://horizon-testnet.stellar.org/accounts/${wallet.stellarAddress}`
+        );
+        const accountData = await res.json();
+        const account = new Account(wallet.stellarAddress!, accountData.sequence);
+
+        // 3. Construir transacción
+        const tx = new TransactionBuilder(account, {
+          fee: "100",
+          networkPassphrase: Networks.TESTNET,
+        })
+          .addOperation(
+            Operation.payment({
+              destination: destinationAddress,
+              asset: Asset.native(),
+              amount: intent.amount.toString(),
+            })
+          )
+          .addMemo(new (await import("@stellar/stellar-sdk")).Memo("text", `Goyo: ${intent.toEmail}`))
+          .setTimeout(60)
+          .build();
+
+        // 4. Firmar y enviar con Accesly
+        const { txHash } = await signAndSubmit(tx.toXDR());
+
         setTxHistory(prev => [
-          `✅ ${intent.amount} XLM → ${intent.toEmail}`,
+          { text: `✅ ${intent.amount} XLM → ${intent.toEmail}`, hash: txHash },
           ...prev
         ]);
-        setStatus(`✅ Enviados ${intent.amount} XLM a ${intent.toEmail}`);
-        
-        // Con Accesly sería:
-        // const { txHash } = await sendPayment({
-        //   destination: resolvedAddress,
-        //   amount: intent.amount.toString(),
-        // });
-        
+        setStatus(`✅ Enviado! TX: ${txHash.slice(0, 8)}...`);
+
       } catch (error: any) {
+        console.error(error);
         setStatus(`❌ Error: ${error.message}`);
       }
+    } else if (intent.type === "transfer" && !wallet) {
+      setStatus("⚠️ Conecta tu wallet primero");
     } else {
       setStatus("🤷 No entendí. Prueba: 'envía 10 lumens a email@test.com'");
     }
@@ -136,6 +184,7 @@ export default function Home() {
             <p className="text-sm text-zinc-400">Conectado como</p>
             <p className="font-mono text-sm truncate">{wallet.email}</p>
             <p className="text-2xl font-bold">{balance || "0"} XLM</p>
+            <p className="text-xs text-zinc-500 truncate">{wallet.stellarAddress}</p>
           </div>
         )}
 
@@ -158,7 +207,7 @@ export default function Home() {
             {transcript && (
               <div className="bg-zinc-800 rounded-lg p-4">
                 <p className="text-sm text-zinc-400 mb-1">Escuché:</p>
-                <p className="text-lg">&ldquo;{transcript}&rdquo;</p>
+                <p className="text-lg">&quot;{transcript}&quot;</p>
               </div>
             )}
 
@@ -173,7 +222,17 @@ export default function Home() {
                 <p className="text-sm text-zinc-400">Historial:</p>
                 {txHistory.map((tx, i) => (
                   <div key={i} className="bg-zinc-900 rounded-lg p-3 text-sm">
-                    {tx}
+                    <p>{tx.text}</p>
+                    {tx.hash && (
+                      <a 
+                        href={`https://stellar.expert/explorer/testnet/tx/${tx.hash}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-blue-400 text-xs hover:underline"
+                      >
+                        Ver en Explorer →
+                      </a>
+                    )}
                   </div>
                 ))}
               </div>
@@ -186,7 +245,7 @@ export default function Home() {
           <div className="text-center text-zinc-500">
             <p>Conecta tu wallet para empezar</p>
             <p className="text-sm mt-2">
-              Comandos: &ldquo;envía 50 lumens a email@test.com&rdquo;
+              Di: &quot;envía 50 lumens a juan arroba test punto com&quot;
             </p>
           </div>
         )}
@@ -194,7 +253,7 @@ export default function Home() {
 
       {/* Footer */}
       <footer className="mt-16 text-center text-zinc-600 text-sm">
-        <p>Stellar Testnet • Powered by Accesly + PersonaPlex</p>
+        <p>Stellar Testnet • Accesly + Supabase</p>
       </footer>
     </div>
   );
