@@ -123,7 +123,7 @@ export default function Home() {
           <div className="bg-zinc-900 rounded-xl p-4 space-y-2">
             <p className="text-sm text-zinc-400">Conectado como</p>
             <p className="font-mono text-sm truncate">{wallet.email}</p>
-            <p className="text-2xl font-bold">{balance?.toFixed(2) || "0"} XLM</p>
+            <p className="text-2xl font-bold">{balance || "0"} XLM</p>
           </div>
         )}
 
