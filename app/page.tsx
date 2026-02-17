@@ -5,30 +5,34 @@ import { ConnectButton, useAccesly } from "accesly";
 import { createClient } from "@supabase/supabase-js";
 import { TransactionBuilder, Networks, Operation, Asset, Account, Memo } from "@stellar/stellar-sdk";
 
-// Supabase client
 const supabase = createClient(
   "https://gbdlfmkenfldrjnzxqst.supabase.co",
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdiZGxmbWtlbmZsZHJqbnp4cXN0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA0OTU3MTgsImV4cCI6MjA4NjA3MTcxOH0.ymikUupRQrvbtzc7jEF3_ljUT4pmfc0JYG7Raqj9-sU"
 );
 
-// TTS - Hablar
-function speak(text: string) {
+// Estado global para controlar el flujo
+let isConversationActive = false;
+let recognition: any = null;
+
+function speak(text: string, onEnd?: () => void) {
   if ('speechSynthesis' in window) {
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = 'es-MX';
-    utterance.rate = 1.0;
+    utterance.rate = 1.1;
+    if (onEnd) {
+      utterance.onend = onEnd;
+    }
     window.speechSynthesis.speak(utterance);
+  } else if (onEnd) {
+    onEnd();
   }
 }
 
-// Fuzzy match - encuentra similitudes
 function fuzzyMatch(query: string, target: string): number {
   const q = query.toLowerCase().replace(/[^a-z0-9]/g, '');
   const t = target.toLowerCase().replace(/[^a-z0-9]/g, '');
   if (t.includes(q) || q.includes(t)) return 1;
-  
-  // Levenshtein simplificado
   let matches = 0;
   for (let i = 0; i < q.length; i++) {
     if (t.includes(q[i])) matches++;
@@ -36,7 +40,6 @@ function fuzzyMatch(query: string, target: string): number {
   return matches / Math.max(q.length, 1);
 }
 
-// Normaliza texto hablado
 function normalizeSpokenText(text: string): string {
   return text
     .replace(/\s+arroba\s+/gi, '@')
@@ -55,24 +58,28 @@ interface Contact {
 export default function Home() {
   const { wallet, balance, signAndSubmit, loading } = useAccesly();
   const [listening, setListening] = useState(false);
-  const [transcript, setTranscript] = useState("");
+  const [conversationMode, setConversationMode] = useState(false);
   const [status, setStatus] = useState("");
   const [conversation, setConversation] = useState<{role: 'user' | 'goyo', text: string}[]>([]);
   const [pendingTransfer, setPendingTransfer] = useState<{amount: number, toEmail: string, toAddress: string} | null>(null);
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [pendingAmount, setPendingAmount] = useState<number | null>(null);
   const chatRef = useRef<HTMLDivElement>(null);
+  const pendingTransferRef = useRef(pendingTransfer);
+  const pendingAmountRef = useRef(pendingAmount);
+  const contactsRef = useRef(contacts);
 
-  // Cargar contactos
+  // Mantener refs actualizados
+  useEffect(() => { pendingTransferRef.current = pendingTransfer; }, [pendingTransfer]);
+  useEffect(() => { pendingAmountRef.current = pendingAmount; }, [pendingAmount]);
+  useEffect(() => { contactsRef.current = contacts; }, [contacts]);
+
   useEffect(() => {
     async function loadContacts() {
-      console.log("Loading contacts...");
-      const { data, error } = await supabase
+      const { data } = await supabase
         .from("wallets")
         .select("email, stellar_address")
         .limit(50);
-      
-      console.log("Contacts loaded:", data, error);
       if (data && data.length > 0) {
         setContacts(data);
       }
@@ -80,44 +87,30 @@ export default function Home() {
     loadContacts();
   }, []);
 
-  // Scroll al final del chat
   useEffect(() => {
     if (chatRef.current) {
       chatRef.current.scrollTop = chatRef.current.scrollHeight;
     }
   }, [conversation]);
 
-  // Saludo inicial
-  useEffect(() => {
-    if (wallet && conversation.length === 0 && contacts.length > 0) {
-      const names = contacts.slice(0, 3).map(c => c.email.split('@')[0]).join(', ');
-      const greeting = `¡Hola! Soy Goyo. Puedo enviar lumens a: ${names}, y más. ¿A quién le envío?`;
-      addMessage('goyo', greeting);
-      speak(greeting);
-    }
-  }, [wallet, contacts]);
-
   const addMessage = (role: 'user' | 'goyo', text: string) => {
     setConversation(prev => [...prev, { role, text }]);
   };
 
-  // Buscar contacto por nombre (fuzzy)
   const findContact = (query: string): Contact | null => {
     const q = query.toLowerCase().replace(/[^a-z0-9@.]/g, '');
+    const currentContacts = contactsRef.current;
     
-    // Primero buscar match exacto en email
-    let found = contacts.find(c => c.email.toLowerCase() === q);
+    let found = currentContacts.find(c => c.email.toLowerCase() === q);
     if (found) return found;
 
-    // Buscar en nombre de usuario (antes del @)
-    found = contacts.find(c => c.email.split('@')[0].toLowerCase() === q);
+    found = currentContacts.find(c => c.email.split('@')[0].toLowerCase() === q);
     if (found) return found;
 
-    // Fuzzy match
     let bestMatch: Contact | null = null;
     let bestScore = 0;
     
-    for (const contact of contacts) {
+    for (const contact of currentContacts) {
       const username = contact.email.split('@')[0];
       const score = fuzzyMatch(q, username);
       if (score > bestScore && score > 0.5) {
@@ -131,21 +124,18 @@ export default function Home() {
 
   const startListening = () => {
     if (!("webkitSpeechRecognition" in window) && !("SpeechRecognition" in window)) {
-      const msg = "Tu navegador no soporta voz. Usa los botones de abajo.";
-      addMessage('goyo', msg);
-      speak(msg);
       return;
     }
 
     const SpeechRecognition = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
-    const recognition = new SpeechRecognition();
+    recognition = new SpeechRecognition();
     recognition.lang = "es-MX";
     recognition.continuous = false;
     recognition.interimResults = false;
 
     recognition.onstart = () => {
       setListening(true);
-      setStatus("🎤 Escuchando...");
+      setStatus("🎤");
     };
 
     recognition.onresult = async (event: any) => {
@@ -158,72 +148,107 @@ export default function Home() {
     recognition.onerror = () => {
       setListening(false);
       setStatus("");
+      // Reintentar si está en modo conversación
+      if (isConversationActive) {
+        setTimeout(() => startListening(), 500);
+      }
     };
+
     recognition.onend = () => {
       setListening(false);
       setStatus("");
     };
+
     recognition.start();
+  };
+
+  const startConversation = () => {
+    isConversationActive = true;
+    setConversationMode(true);
+    const names = contacts.slice(0, 3).map(c => c.email.split('@')[0]).join(', ');
+    const greeting = `¡Hola! Soy Goyo. Puedo enviar a ${names} y más. ¿Qué necesitas?`;
+    addMessage('goyo', greeting);
+    speak(greeting, () => {
+      if (isConversationActive) startListening();
+    });
+  };
+
+  const stopConversation = () => {
+    isConversationActive = false;
+    setConversationMode(false);
+    setListening(false);
+    window.speechSynthesis.cancel();
+    if (recognition) {
+      try { recognition.stop(); } catch {}
+    }
+    setStatus("");
+  };
+
+  const respondAndListen = (text: string) => {
+    addMessage('goyo', text);
+    speak(text, () => {
+      if (isConversationActive) {
+        setTimeout(() => startListening(), 300);
+      }
+    });
   };
 
   const processConversation = async (userText: string) => {
     const normalized = normalizeSpokenText(userText);
     addMessage('user', normalized);
-    setTranscript(normalized);
+
+    // Detectar "para" o "detente" o "adiós"
+    if (/^(para|detente|stop|adiós|adios|bye|chao|termina)/i.test(normalized)) {
+      stopConversation();
+      addMessage('goyo', "¡Hasta luego!");
+      speak("¡Hasta luego!");
+      return;
+    }
+
+    const currentPending = pendingTransferRef.current;
+    const currentAmount = pendingAmountRef.current;
 
     // Confirmación
-    if (pendingTransfer && /^(sí|si|yes|ok|confirma|dale|va|hazlo|claro|adelante)/i.test(normalized)) {
+    if (currentPending && /^(sí|si|yes|ok|confirma|dale|va|hazlo|claro|adelante|afirmativo)/i.test(normalized)) {
       await executeTransfer();
       return;
     }
 
     // Cancelación
-    if (pendingTransfer && /^(no|cancela|olvídalo|mejor no|nel)/i.test(normalized)) {
+    if (currentPending && /^(no|cancela|olvídalo|mejor no|nel|negativo)/i.test(normalized)) {
       setPendingTransfer(null);
-      const msg = "Cancelado. ¿Qué más?";
-      addMessage('goyo', msg);
-      speak(msg);
+      respondAndListen("Cancelado. ¿Qué más?");
       return;
     }
 
     // Si hay monto pendiente y dice un nombre
-    if (pendingAmount && !normalized.match(/\d+/)) {
+    if (currentAmount && !normalized.match(/\d+/)) {
       const contact = findContact(normalized);
       if (contact) {
-        setPendingTransfer({ amount: pendingAmount, toEmail: contact.email, toAddress: contact.stellar_address });
+        setPendingTransfer({ amount: currentAmount, toEmail: contact.email, toAddress: contact.stellar_address });
         setPendingAmount(null);
-        const msg = `¿Envío ${pendingAmount} lumens a ${contact.email}? Di sí para confirmar.`;
-        addMessage('goyo', msg);
-        speak(msg);
+        respondAndListen(`¿Envío ${currentAmount} lumens a ${contact.email.split('@')[0]}? Di sí o no.`);
         return;
       }
     }
 
     // Listar contactos
-    if (/lista|contactos|correos|emails|quién|a quién|quiénes/i.test(normalized)) {
-      if (contacts.length === 0) {
-        const msg = "No tengo contactos cargados. Intenta recargar la página.";
-        addMessage('goyo', msg);
-        speak(msg);
-        return;
-      }
-      const names = contacts.slice(0, 6).map(c => c.email.split('@')[0]).join(', ');
-      const msg = `Mis contactos son: ${names}. Dime un nombre y cuánto enviar.`;
-      addMessage('goyo', msg);
-      speak(msg);
+    if (/lista|contactos|quién|quiénes|opciones/i.test(normalized)) {
+      const names = contactsRef.current.slice(0, 6).map(c => c.email.split('@')[0]).join(', ');
+      respondAndListen(`Tengo: ${names}. ¿A quién le envío?`);
       return;
     }
 
-    // Detectar transferencia con monto
+    // Detectar monto
     const amountMatch = normalized.match(/(\d+(?:\.\d+)?)/);
     const amount = amountMatch ? parseFloat(amountMatch[1]) : null;
 
-    // Buscar nombre en el texto
+    // Buscar nombre
     const words = normalized.split(/\s+/);
     let foundContact: Contact | null = null;
     
     for (const word of words) {
-      if (word.length > 2 && !/^\d+$/.test(word) && !['envía', 'envia', 'manda', 'lumens', 'lumen', 'xlm', 'a'].includes(word.toLowerCase())) {
+      if (word.length > 2 && !/^\d+$/.test(word) && !['envía', 'envia', 'manda', 'lumens', 'lumen', 'xlm', 'a', 'para'].includes(word.toLowerCase())) {
         const contact = findContact(word);
         if (contact) {
           foundContact = contact;
@@ -232,45 +257,38 @@ export default function Home() {
       }
     }
 
-    // Tenemos monto y contacto
+    // Monto y contacto
     if (amount && foundContact) {
       setPendingTransfer({ amount, toEmail: foundContact.email, toAddress: foundContact.stellar_address });
-      const msg = `¿Envío ${amount} lumens a ${foundContact.email}? Di sí para confirmar.`;
-      addMessage('goyo', msg);
-      speak(msg);
+      respondAndListen(`¿${amount} lumens a ${foundContact.email.split('@')[0]}? Di sí para enviar.`);
       return;
     }
 
-    // Solo monto, preguntar a quién
+    // Solo monto
     if (amount && !foundContact) {
       setPendingAmount(amount);
-      const names = contacts.slice(0, 4).map(c => c.email.split('@')[0]).join(', ');
-      const msg = `${amount} lumens, ¿a quién? Tengo: ${names}...`;
-      addMessage('goyo', msg);
-      speak(msg);
+      const names = contactsRef.current.slice(0, 3).map(c => c.email.split('@')[0]).join(', ');
+      respondAndListen(`${amount} lumens, ¿a quién? Tengo ${names}...`);
       return;
     }
 
-    // Solo nombre, preguntar cuánto
+    // Solo nombre
     if (foundContact && !amount) {
-      const msg = `Encontré a ${foundContact.email}. ¿Cuántos lumens le envío?`;
-      addMessage('goyo', msg);
-      speak(msg);
+      respondAndListen(`${foundContact.email.split('@')[0]}, ¿cuántos lumens?`);
       return;
     }
 
     // No entendió
-    const names = contacts.slice(0, 3).map(c => c.email.split('@')[0]).join(', ');
-    const msg = `Dime algo como: "50 lumens a ${contacts[0]?.email.split('@')[0] || 'nombre'}". O di "lista" para ver contactos.`;
-    addMessage('goyo', msg);
-    speak(msg);
+    const firstName = contactsRef.current[0]?.email.split('@')[0] || 'alguien';
+    respondAndListen(`Di algo como: 50 lumens a ${firstName}. O di lista para ver contactos.`);
   };
 
   const executeTransfer = async () => {
-    if (!pendingTransfer || !wallet) return;
+    const transfer = pendingTransferRef.current;
+    if (!transfer || !wallet) return;
 
     try {
-      setStatus("💸 Enviando...");
+      setStatus("💸");
       speak("Enviando...");
 
       const res = await fetch(
@@ -285,55 +303,54 @@ export default function Home() {
       })
         .addOperation(
           Operation.payment({
-            destination: pendingTransfer.toAddress,
+            destination: transfer.toAddress,
             asset: Asset.native(),
-            amount: pendingTransfer.amount.toString(),
+            amount: transfer.amount.toString(),
           })
         )
         .addMemo(Memo.text("Goyo"))
         .setTimeout(60)
         .build();
 
-      const result = await signAndSubmit(tx.toXDR());
-      const txHash = result?.txHash || "ok";
+      await signAndSubmit(tx.toXDR());
 
-      const msg = `¡Listo! Envié ${pendingTransfer.amount} lumens a ${pendingTransfer.toEmail.split('@')[0]}. ¿Algo más?`;
-      addMessage('goyo', msg);
-      speak(msg);
-      setStatus(`✅ Enviado`);
       setPendingTransfer(null);
+      setStatus("✅");
+      respondAndListen(`¡Listo! Envié ${transfer.amount} lumens a ${transfer.toEmail.split('@')[0]}. ¿Algo más?`);
 
     } catch (error: any) {
-      const msg = `Error: ${error.message}. ¿Intentamos de nuevo?`;
-      addMessage('goyo', msg);
-      speak(msg);
       setStatus("");
       setPendingTransfer(null);
+      respondAndListen(`Error: ${error.message}. ¿Intentamos de nuevo?`);
     }
-  };
-
-  const quickSend = (contact: Contact) => {
-    processConversation(`envía 10 lumens a ${contact.email}`);
   };
 
   return (
     <div className="h-screen bg-black text-white flex flex-col">
-      {/* Header fijo */}
-      <div className="p-3 border-b border-zinc-800">
-        <div className="flex items-center justify-between">
+      {/* Header */}
+      <div className="p-3 border-b border-zinc-800 flex items-center justify-between">
+        <div className="flex items-center gap-2">
           <h1 className="text-xl font-bold">🎙️ Goyo</h1>
-          <ConnectButton />
+          {conversationMode && (
+            <span className="text-xs bg-green-600 px-2 py-1 rounded-full animate-pulse">
+              LIVE
+            </span>
+          )}
         </div>
-        {wallet && (
-          <p className="text-sm text-zinc-400 mt-1">{balance || "0"} XLM</p>
-        )}
+        <ConnectButton />
       </div>
 
-      {/* Chat scrolleable */}
+      {wallet && (
+        <div className="px-3 py-2 text-sm text-zinc-400 border-b border-zinc-800">
+          {balance || "0"} XLM
+        </div>
+      )}
+
+      {/* Chat */}
       <div ref={chatRef} className="flex-1 overflow-y-auto p-3 space-y-3 pb-32">
         {!wallet && (
           <div className="text-center text-zinc-500 py-8">
-            <p className="text-lg mb-2">👆 Conecta tu wallet para empezar</p>
+            <p className="text-lg mb-2">👆 Conecta tu wallet</p>
           </div>
         )}
         
@@ -351,21 +368,26 @@ export default function Home() {
           </div>
         ))}
 
-        {status && (
-          <p className="text-center text-sm text-zinc-400">{status}</p>
+        {listening && (
+          <div className="text-center">
+            <span className="inline-block w-4 h-4 bg-red-500 rounded-full animate-pulse"></span>
+            <p className="text-xs text-zinc-500 mt-1">Escuchando...</p>
+          </div>
         )}
       </div>
 
       {/* Contactos rápidos */}
-      {wallet && contacts.length > 0 && (
-        <div className="px-3 pb-2">
-          <p className="text-xs text-zinc-500 mb-2">Envío rápido (10 XLM):</p>
-          <div className="flex gap-2 overflow-x-auto pb-2">
-            {contacts.slice(0, 6).map(contact => (
+      {wallet && contacts.length > 0 && !conversationMode && (
+        <div className="px-3 pb-2 border-t border-zinc-800 pt-2">
+          <div className="flex gap-2 overflow-x-auto">
+            {contacts.slice(0, 5).map(contact => (
               <button
                 key={contact.email}
-                onClick={() => quickSend(contact)}
-                className="bg-zinc-800 px-3 py-2 rounded-full text-xs whitespace-nowrap hover:bg-zinc-700"
+                onClick={() => {
+                  if (!conversationMode) startConversation();
+                  setTimeout(() => processConversation(`10 lumens a ${contact.email.split('@')[0]}`), 1000);
+                }}
+                className="bg-zinc-800 px-3 py-2 rounded-full text-xs whitespace-nowrap"
               >
                 {contact.email.split('@')[0]}
               </button>
@@ -374,20 +396,25 @@ export default function Home() {
         </div>
       )}
 
-      {/* Botón fijo abajo */}
+      {/* Botón principal */}
       {wallet && (
         <div className="p-3 border-t border-zinc-800 bg-black">
-          <button
-            onClick={startListening}
-            disabled={listening || loading}
-            className={`w-full py-4 rounded-2xl text-lg font-bold transition-all ${
-              listening
-                ? "bg-red-600 animate-pulse"
-                : "bg-white text-black active:scale-95"
-            }`}
-          >
-            {listening ? "🎤 Escuchando..." : "🎤 Hablar"}
-          </button>
+          {!conversationMode ? (
+            <button
+              onClick={startConversation}
+              disabled={loading || contacts.length === 0}
+              className="w-full py-5 rounded-2xl text-lg font-bold bg-green-600 active:scale-95 transition-transform"
+            >
+              🎤 Iniciar conversación
+            </button>
+          ) : (
+            <button
+              onClick={stopConversation}
+              className="w-full py-5 rounded-2xl text-lg font-bold bg-red-600 active:scale-95 transition-transform"
+            >
+              ⏹️ Terminar conversación
+            </button>
+          )}
         </div>
       )}
     </div>
