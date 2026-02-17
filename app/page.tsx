@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { ConnectButton, useAccesly } from "accesly";
 import { createClient } from "@supabase/supabase-js";
 import { TransactionBuilder, Networks, Operation, Asset, Account, Memo } from "@stellar/stellar-sdk";
@@ -17,9 +17,23 @@ function speak(text: string) {
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = 'es-MX';
-    utterance.rate = 1.1;
+    utterance.rate = 1.0;
     window.speechSynthesis.speak(utterance);
   }
+}
+
+// Fuzzy match - encuentra similitudes
+function fuzzyMatch(query: string, target: string): number {
+  const q = query.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const t = target.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (t.includes(q) || q.includes(t)) return 1;
+  
+  // Levenshtein simplificado
+  let matches = 0;
+  for (let i = 0; i < q.length; i++) {
+    if (t.includes(q[i])) matches++;
+  }
+  return matches / Math.max(q.length, 1);
 }
 
 // Normaliza texto hablado
@@ -33,34 +47,9 @@ function normalizeSpokenText(text: string): string {
     .trim();
 }
 
-// Busca stellar address por email
-async function getAddressByEmail(email: string): Promise<string | null> {
-  const { data, error } = await supabase
-    .from("wallets")
-    .select("stellar_address")
-    .eq("email", email)
-    .single();
-  if (error || !data) return null;
-  return data.stellar_address;
-}
-
-// Busca emails similares
-async function searchEmails(query: string): Promise<string[]> {
-  const { data } = await supabase
-    .from("wallets")
-    .select("email")
-    .ilike("email", `%${query}%`)
-    .limit(5);
-  return data?.map(d => d.email) || [];
-}
-
-// Obtiene todos los emails
-async function getAllEmails(): Promise<string[]> {
-  const { data } = await supabase
-    .from("wallets")
-    .select("email")
-    .limit(20);
-  return data?.map(d => d.email) || [];
+interface Contact {
+  email: string;
+  stellar_address: string;
 }
 
 export default function Home() {
@@ -70,33 +59,85 @@ export default function Home() {
   const [status, setStatus] = useState("");
   const [conversation, setConversation] = useState<{role: 'user' | 'goyo', text: string}[]>([]);
   const [pendingTransfer, setPendingTransfer] = useState<{amount: number, toEmail: string, toAddress: string} | null>(null);
-  const [availableEmails, setAvailableEmails] = useState<string[]>([]);
+  const [contacts, setContacts] = useState<Contact[]>([]);
+  const [pendingAmount, setPendingAmount] = useState<number | null>(null);
+  const chatRef = useRef<HTMLDivElement>(null);
 
-  // Cargar emails al inicio
+  // Cargar contactos
   useEffect(() => {
-    getAllEmails().then(setAvailableEmails);
+    async function loadContacts() {
+      console.log("Loading contacts...");
+      const { data, error } = await supabase
+        .from("wallets")
+        .select("email, stellar_address")
+        .limit(50);
+      
+      console.log("Contacts loaded:", data, error);
+      if (data && data.length > 0) {
+        setContacts(data);
+      }
+    }
+    loadContacts();
   }, []);
+
+  // Scroll al final del chat
+  useEffect(() => {
+    if (chatRef.current) {
+      chatRef.current.scrollTop = chatRef.current.scrollHeight;
+    }
+  }, [conversation]);
 
   // Saludo inicial
   useEffect(() => {
-    if (wallet && conversation.length === 0) {
-      const greeting = `¡Hola! Soy Goyo, tu asistente de pagos. Puedes decirme cosas como: envía 10 lumens a un correo. ¿A quién quieres enviar?`;
+    if (wallet && conversation.length === 0 && contacts.length > 0) {
+      const names = contacts.slice(0, 3).map(c => c.email.split('@')[0]).join(', ');
+      const greeting = `¡Hola! Soy Goyo. Puedo enviar lumens a: ${names}, y más. ¿A quién le envío?`;
       addMessage('goyo', greeting);
       speak(greeting);
     }
-  }, [wallet]);
+  }, [wallet, contacts]);
 
   const addMessage = (role: 'user' | 'goyo', text: string) => {
     setConversation(prev => [...prev, { role, text }]);
   };
 
+  // Buscar contacto por nombre (fuzzy)
+  const findContact = (query: string): Contact | null => {
+    const q = query.toLowerCase().replace(/[^a-z0-9@.]/g, '');
+    
+    // Primero buscar match exacto en email
+    let found = contacts.find(c => c.email.toLowerCase() === q);
+    if (found) return found;
+
+    // Buscar en nombre de usuario (antes del @)
+    found = contacts.find(c => c.email.split('@')[0].toLowerCase() === q);
+    if (found) return found;
+
+    // Fuzzy match
+    let bestMatch: Contact | null = null;
+    let bestScore = 0;
+    
+    for (const contact of contacts) {
+      const username = contact.email.split('@')[0];
+      const score = fuzzyMatch(q, username);
+      if (score > bestScore && score > 0.5) {
+        bestScore = score;
+        bestMatch = contact;
+      }
+    }
+    
+    return bestMatch;
+  };
+
   const startListening = () => {
-    if (!("webkitSpeechRecognition" in window)) {
-      speak("Tu navegador no soporta voz");
+    if (!("webkitSpeechRecognition" in window) && !("SpeechRecognition" in window)) {
+      const msg = "Tu navegador no soporta voz. Usa los botones de abajo.";
+      addMessage('goyo', msg);
+      speak(msg);
       return;
     }
 
-    const SpeechRecognition = (window as any).webkitSpeechRecognition;
+    const SpeechRecognition = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
     const recognition = new SpeechRecognition();
     recognition.lang = "es-MX";
     recognition.continuous = false;
@@ -110,11 +151,18 @@ export default function Home() {
     recognition.onresult = async (event: any) => {
       const text = event.results[0][0].transcript;
       setListening(false);
+      setStatus("");
       await processConversation(text);
     };
 
-    recognition.onerror = () => setListening(false);
-    recognition.onend = () => setListening(false);
+    recognition.onerror = () => {
+      setListening(false);
+      setStatus("");
+    };
+    recognition.onend = () => {
+      setListening(false);
+      setStatus("");
+    };
     recognition.start();
   };
 
@@ -123,92 +171,97 @@ export default function Home() {
     addMessage('user', normalized);
     setTranscript(normalized);
 
-    // Detectar confirmación
-    if (pendingTransfer && /^(sí|si|yes|ok|confirma|dale|va|hazlo)/i.test(normalized)) {
+    // Confirmación
+    if (pendingTransfer && /^(sí|si|yes|ok|confirma|dale|va|hazlo|claro|adelante)/i.test(normalized)) {
       await executeTransfer();
       return;
     }
 
-    // Detectar cancelación
-    if (pendingTransfer && /^(no|cancela|olvídalo|mejor no)/i.test(normalized)) {
+    // Cancelación
+    if (pendingTransfer && /^(no|cancela|olvídalo|mejor no|nel)/i.test(normalized)) {
       setPendingTransfer(null);
-      const msg = "Ok, cancelado. ¿Qué más necesitas?";
+      const msg = "Cancelado. ¿Qué más?";
       addMessage('goyo', msg);
       speak(msg);
       return;
     }
 
-    // Detectar "listar contactos"
-    if (/lista|contactos|correos|emails|quién|a quién/i.test(normalized)) {
-      const names = availableEmails.slice(0, 5).map(e => e.split('@')[0]).join(', ');
-      const msg = `Tengo estos contactos: ${names}. ¿A cuál quieres enviar?`;
-      addMessage('goyo', msg);
-      speak(msg);
-      return;
-    }
-
-    // Detectar transferencia
-    const transferMatch = normalized.match(/(?:env[ií]a?|manda|transfer)\s+(\d+(?:\.\d+)?)\s*(?:lumens?|xlm)?\s*(?:a\s+)?([^\s]+@[^\s]+)?/i);
-    
-    if (transferMatch) {
-      const amount = parseFloat(transferMatch[1]);
-      let toEmail = transferMatch[2]?.toLowerCase();
-
-      // Si no hay email, preguntar
-      if (!toEmail) {
-        const msg = `¿${amount} lumens a quién? Dime el correo o el nombre.`;
+    // Si hay monto pendiente y dice un nombre
+    if (pendingAmount && !normalized.match(/\d+/)) {
+      const contact = findContact(normalized);
+      if (contact) {
+        setPendingTransfer({ amount: pendingAmount, toEmail: contact.email, toAddress: contact.stellar_address });
+        setPendingAmount(null);
+        const msg = `¿Envío ${pendingAmount} lumens a ${contact.email}? Di sí para confirmar.`;
         addMessage('goyo', msg);
         speak(msg);
         return;
       }
+    }
 
-      // Buscar en DB
-      setStatus("🔍 Buscando...");
-      let address = await getAddressByEmail(toEmail);
+    // Listar contactos
+    if (/lista|contactos|correos|emails|quién|a quién|quiénes/i.test(normalized)) {
+      if (contacts.length === 0) {
+        const msg = "No tengo contactos cargados. Intenta recargar la página.";
+        addMessage('goyo', msg);
+        speak(msg);
+        return;
+      }
+      const names = contacts.slice(0, 6).map(c => c.email.split('@')[0]).join(', ');
+      const msg = `Mis contactos son: ${names}. Dime un nombre y cuánto enviar.`;
+      addMessage('goyo', msg);
+      speak(msg);
+      return;
+    }
 
-      // Si no encontró, buscar similar
-      if (!address) {
-        const similar = await searchEmails(toEmail.split('@')[0]);
-        if (similar.length > 0) {
-          toEmail = similar[0];
-          address = await getAddressByEmail(toEmail);
+    // Detectar transferencia con monto
+    const amountMatch = normalized.match(/(\d+(?:\.\d+)?)/);
+    const amount = amountMatch ? parseFloat(amountMatch[1]) : null;
+
+    // Buscar nombre en el texto
+    const words = normalized.split(/\s+/);
+    let foundContact: Contact | null = null;
+    
+    for (const word of words) {
+      if (word.length > 2 && !/^\d+$/.test(word) && !['envía', 'envia', 'manda', 'lumens', 'lumen', 'xlm', 'a'].includes(word.toLowerCase())) {
+        const contact = findContact(word);
+        if (contact) {
+          foundContact = contact;
+          break;
         }
       }
+    }
 
-      if (!address) {
-        const msg = `No encontré a ${toEmail} en la base de datos. ¿Quieres intentar con otro correo?`;
-        addMessage('goyo', msg);
-        speak(msg);
-        return;
-      }
-
-      // Pedir confirmación
-      setPendingTransfer({ amount, toEmail, toAddress: address });
-      const shortAddr = address.slice(0, 8);
-      const msg = `Voy a enviar ${amount} lumens a ${toEmail}. Su wallet es ${shortAddr}... ¿Confirmas?`;
+    // Tenemos monto y contacto
+    if (amount && foundContact) {
+      setPendingTransfer({ amount, toEmail: foundContact.email, toAddress: foundContact.stellar_address });
+      const msg = `¿Envío ${amount} lumens a ${foundContact.email}? Di sí para confirmar.`;
       addMessage('goyo', msg);
       speak(msg);
       return;
     }
 
-    // Detectar solo nombre/email
-    const emailMatch = normalized.match(/([^\s]+@[^\s]+)/i);
-    const nameMatch = normalized.match(/(?:a\s+)?(\w+)/i);
-    
-    if (emailMatch || nameMatch) {
-      const query = emailMatch ? emailMatch[1] : nameMatch![1];
-      const results = await searchEmails(query);
-      
-      if (results.length > 0) {
-        const msg = `Encontré a ${results[0]}. ¿Cuántos lumens quieres enviarle?`;
-        addMessage('goyo', msg);
-        speak(msg);
-        return;
-      }
+    // Solo monto, preguntar a quién
+    if (amount && !foundContact) {
+      setPendingAmount(amount);
+      const names = contacts.slice(0, 4).map(c => c.email.split('@')[0]).join(', ');
+      const msg = `${amount} lumens, ¿a quién? Tengo: ${names}...`;
+      addMessage('goyo', msg);
+      speak(msg);
+      return;
+    }
+
+    // Solo nombre, preguntar cuánto
+    if (foundContact && !amount) {
+      const msg = `Encontré a ${foundContact.email}. ¿Cuántos lumens le envío?`;
+      addMessage('goyo', msg);
+      speak(msg);
+      return;
     }
 
     // No entendió
-    const msg = "No entendí. Puedes decir: envía 50 lumens a correo@ejemplo.com, o pregúntame quiénes están en la lista.";
+    const names = contacts.slice(0, 3).map(c => c.email.split('@')[0]).join(', ');
+    const msg = `Dime algo como: "50 lumens a ${contacts[0]?.email.split('@')[0] || 'nombre'}". O di "lista" para ver contactos.`;
     addMessage('goyo', msg);
     speak(msg);
   };
@@ -220,14 +273,12 @@ export default function Home() {
       setStatus("💸 Enviando...");
       speak("Enviando...");
 
-      // Obtener cuenta
       const res = await fetch(
         `https://horizon-testnet.stellar.org/accounts/${wallet.stellarAddress}`
       );
       const accountData = await res.json();
       const account = new Account(wallet.stellarAddress!, accountData.sequence);
 
-      // Construir TX
       const tx = new TransactionBuilder(account, {
         fee: "100",
         networkPassphrase: Networks.TESTNET,
@@ -243,91 +294,100 @@ export default function Home() {
         .setTimeout(60)
         .build();
 
-      // Firmar y enviar
       const result = await signAndSubmit(tx.toXDR());
-      const txHash = result?.txHash || "completado";
+      const txHash = result?.txHash || "ok";
 
-      const msg = `¡Listo! Envié ${pendingTransfer.amount} lumens a ${pendingTransfer.toEmail}. La transacción fue exitosa. ¿Algo más?`;
+      const msg = `¡Listo! Envié ${pendingTransfer.amount} lumens a ${pendingTransfer.toEmail.split('@')[0]}. ¿Algo más?`;
       addMessage('goyo', msg);
       speak(msg);
-      setStatus(`✅ TX: ${txHash.slice(0, 8)}...`);
+      setStatus(`✅ Enviado`);
       setPendingTransfer(null);
 
     } catch (error: any) {
-      const msg = `Hubo un error: ${error.message}. ¿Quieres intentar de nuevo?`;
+      const msg = `Error: ${error.message}. ¿Intentamos de nuevo?`;
       addMessage('goyo', msg);
       speak(msg);
+      setStatus("");
       setPendingTransfer(null);
     }
   };
 
+  const quickSend = (contact: Contact) => {
+    processConversation(`envía 10 lumens a ${contact.email}`);
+  };
+
   return (
-    <div className="min-h-screen bg-black text-white flex flex-col p-4">
-      {/* Header */}
-      <div className="text-center py-4">
-        <h1 className="text-2xl font-bold">🎙️ Goyo 2.0</h1>
-        <ConnectButton />
+    <div className="h-screen bg-black text-white flex flex-col">
+      {/* Header fijo */}
+      <div className="p-3 border-b border-zinc-800">
+        <div className="flex items-center justify-between">
+          <h1 className="text-xl font-bold">🎙️ Goyo</h1>
+          <ConnectButton />
+        </div>
+        {wallet && (
+          <p className="text-sm text-zinc-400 mt-1">{balance || "0"} XLM</p>
+        )}
       </div>
 
-      {/* Wallet Info */}
-      {wallet && (
-        <div className="bg-zinc-900 rounded-lg p-3 mb-4 text-sm">
-          <p className="text-zinc-400">{wallet.email}</p>
-          <p className="text-xl font-bold">{balance || "0"} XLM</p>
-        </div>
-      )}
-
-      {/* Conversation */}
-      <div className="flex-1 overflow-y-auto space-y-3 mb-4">
+      {/* Chat scrolleable */}
+      <div ref={chatRef} className="flex-1 overflow-y-auto p-3 space-y-3 pb-32">
+        {!wallet && (
+          <div className="text-center text-zinc-500 py-8">
+            <p className="text-lg mb-2">👆 Conecta tu wallet para empezar</p>
+          </div>
+        )}
+        
         {conversation.map((msg, i) => (
           <div 
             key={i} 
-            className={`p-3 rounded-lg max-w-[85%] ${
+            className={`p-3 rounded-2xl max-w-[85%] ${
               msg.role === 'user' 
                 ? 'bg-blue-600 ml-auto' 
                 : 'bg-zinc-800'
             }`}
           >
-            <p className="text-xs text-zinc-400 mb-1">
-              {msg.role === 'user' ? 'Tú' : '🤖 Goyo'}
-            </p>
-            <p>{msg.text}</p>
+            {msg.role === 'goyo' && <p className="text-xs text-zinc-400 mb-1">🤖 Goyo</p>}
+            <p className="text-sm">{msg.text}</p>
           </div>
         ))}
+
+        {status && (
+          <p className="text-center text-sm text-zinc-400">{status}</p>
+        )}
       </div>
 
-      {/* Status */}
-      {status && (
-        <p className="text-center text-sm text-zinc-400 mb-2">{status}</p>
+      {/* Contactos rápidos */}
+      {wallet && contacts.length > 0 && (
+        <div className="px-3 pb-2">
+          <p className="text-xs text-zinc-500 mb-2">Envío rápido (10 XLM):</p>
+          <div className="flex gap-2 overflow-x-auto pb-2">
+            {contacts.slice(0, 6).map(contact => (
+              <button
+                key={contact.email}
+                onClick={() => quickSend(contact)}
+                className="bg-zinc-800 px-3 py-2 rounded-full text-xs whitespace-nowrap hover:bg-zinc-700"
+              >
+                {contact.email.split('@')[0]}
+              </button>
+            ))}
+          </div>
+        </div>
       )}
 
-      {/* Voice Button */}
+      {/* Botón fijo abajo */}
       {wallet && (
-        <button
-          onClick={startListening}
-          disabled={listening || loading}
-          className={`w-full py-6 rounded-xl text-xl font-bold transition-all ${
-            listening
-              ? "bg-red-600 animate-pulse"
-              : "bg-white text-black"
-          }`}
-        >
-          {listening ? "🎤 Escuchando..." : "🎤 Hablar con Goyo"}
-        </button>
-      )}
-
-      {/* Quick actions */}
-      {wallet && availableEmails.length > 0 && (
-        <div className="mt-4 flex flex-wrap gap-2">
-          {availableEmails.slice(0, 4).map(email => (
-            <button
-              key={email}
-              onClick={() => processConversation(`envía 10 lumens a ${email}`)}
-              className="bg-zinc-800 px-3 py-2 rounded-lg text-xs"
-            >
-              {email.split('@')[0]}
-            </button>
-          ))}
+        <div className="p-3 border-t border-zinc-800 bg-black">
+          <button
+            onClick={startListening}
+            disabled={listening || loading}
+            className={`w-full py-4 rounded-2xl text-lg font-bold transition-all ${
+              listening
+                ? "bg-red-600 animate-pulse"
+                : "bg-white text-black active:scale-95"
+            }`}
+          >
+            {listening ? "🎤 Escuchando..." : "🎤 Hablar"}
+          </button>
         </div>
       )}
     </div>
