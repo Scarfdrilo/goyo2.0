@@ -290,43 +290,47 @@ export default function Home() {
               <GoyoBlob state={blobState} />
             </Suspense>
 
-            {/* Botón gomita central */}
+            {/* Mensaje arriba del botón */}
+            {lastMessage && (
+              <p className="mb-4 text-center text-zinc-400 text-sm max-w-xs px-4">
+                {lastMessage}
+              </p>
+            )}
+
+            {/* Estado */}
+            <p className="mb-2 text-xs text-zinc-600 tracking-wider h-4">
+              {blobState === "listening" ? "escuchando" :
+               blobState === "speaking" ? "hablando" :
+               blobState === "processing" ? "procesando" : ""}
+            </p>
+
+            {/* Botón micrófono */}
             <button
               onClick={handleButtonPress}
               disabled={loading || contacts.length === 0}
               className={`
-                mt-4 px-12 py-6 rounded-full text-lg font-light tracking-wide
+                w-20 h-20 rounded-full flex items-center justify-center
                 transition-all duration-200 ease-out
                 ${buttonPressed ? 'scale-90' : 'scale-100 hover:scale-105'}
                 ${conversationMode 
-                  ? 'bg-red-500/80 text-white' 
-                  : 'bg-green-500/80 text-black'
+                  ? 'bg-red-500' 
+                  : 'bg-green-500'
                 }
                 active:scale-90
                 shadow-lg
-                ${conversationMode ? 'shadow-red-500/30' : 'shadow-green-500/30'}
+                ${conversationMode ? 'shadow-red-500/40' : 'shadow-green-500/40'}
               `}
-              style={{
-                backdropFilter: 'blur(10px)',
-              }}
             >
-              {conversationMode ? 'terminar' : 'hablar'}
+              {conversationMode ? (
+                <svg className="w-8 h-8 text-white" fill="currentColor" viewBox="0 0 24 24">
+                  <rect x="6" y="6" width="12" height="12" rx="2" />
+                </svg>
+              ) : (
+                <svg className="w-8 h-8 text-black" fill="currentColor" viewBox="0 0 24 24">
+                  <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.91-3c-.49 0-.9.36-.98.85C16.52 14.2 14.47 16 12 16s-4.52-1.8-4.93-4.15c-.08-.49-.49-.85-.98-.85-.61 0-1.09.54-1 1.14.49 3 2.89 5.35 5.91 5.78V20c0 .55.45 1 1 1s1-.45 1-1v-2.08c3.02-.43 5.42-2.78 5.91-5.78.1-.6-.39-1.14-1-1.14z"/>
+                </svg>
+              )}
             </button>
-
-            {/* Estado */}
-            <p className="mt-6 text-xs text-zinc-600 tracking-wider">
-              {blobState === "listening" ? "escuchando" :
-               blobState === "speaking" ? "hablando" :
-               blobState === "processing" ? "procesando" :
-               conversationMode ? "esperando" : ""}
-            </p>
-
-            {/* Mensaje */}
-            {lastMessage && (
-              <p className="mt-4 text-center text-zinc-400 text-sm max-w-xs px-4">
-                {lastMessage}
-              </p>
-            )}
           </>
         ) : (
           <div className="text-center">
