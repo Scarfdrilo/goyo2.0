@@ -69,6 +69,7 @@ export default function Home() {
   const [pendingTransfer, setPendingTransfer] = useState<{amount: number, toEmail: string, toAddress: string} | null>(null);
   const [pendingAmount, setPendingAmount] = useState<number | null>(null);
   const [buttonPressed, setButtonPressed] = useState(false);
+  const [toast, setToast] = useState<{message: string, txHash?: string} | null>(null);
   
   const pendingTransferRef = useRef(pendingTransfer);
   const pendingAmountRef = useRef(pendingAmount);
@@ -247,8 +248,16 @@ export default function Home() {
         .addMemo(Memo.text("Goyo"))
         .setTimeout(60)
         .build();
-      await signAndSubmit(tx.toXDR());
+      const result = await signAndSubmit(tx.toXDR());
+      const txHash = result?.txHash;
       setPendingTransfer(null);
+      
+      // Mostrar toast con link
+      if (txHash) {
+        setToast({ message: `${transfer.amount} XLM enviados`, txHash });
+        setTimeout(() => setToast(null), 8000);
+      }
+      
       respondAndListen(`Listo! Envie ${transfer.amount} lumens a ${transfer.toEmail.split('@')[0]}. Algo mas?`);
     } catch (error: any) {
       setPendingTransfer(null);
@@ -267,7 +276,28 @@ export default function Home() {
   };
 
   return (
-    <div className="min-h-screen bg-black text-white flex flex-col">
+    <div className="min-h-screen bg-black text-white flex flex-col relative">
+      {/* Toast notification */}
+      {toast && (
+        <div className="fixed top-4 left-4 right-4 z-50 animate-slide-down">
+          <a
+            href={`https://stellar.expert/explorer/testnet/tx/${toast.txHash}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="block bg-green-500/90 backdrop-blur-sm rounded-2xl p-4 shadow-lg shadow-green-500/20"
+          >
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-black font-medium">{toast.message}</p>
+                <p className="text-black/60 text-xs mt-1">toca para ver en explorer</p>
+              </div>
+              <svg className="w-5 h-5 text-black/60" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+              </svg>
+            </div>
+          </a>
+        </div>
+      )}
       {/* Header minimalista */}
       <div className="p-4 flex items-center justify-between">
         <span className="text-lg font-light tracking-wider">goyo</span>
