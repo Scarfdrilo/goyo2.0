@@ -1,13 +1,20 @@
 import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
 
-// Server-side only - uses service role key for RLS bypass
-const supabaseAdmin = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL || "https://gbdlfmkenfldrjnzxqst.supabase.co",
-  process.env.SUPABASE_SERVICE_ROLE_KEY || ""
-);
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || "https://gbdlfmkenfldrjnzxqst.supabase.co";
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+// Only create client if key exists
+const supabaseAdmin = SUPABASE_KEY 
+  ? createClient(SUPABASE_URL, SUPABASE_KEY)
+  : null;
 
 export async function GET() {
+  if (!supabaseAdmin) {
+    console.error("SUPABASE_SERVICE_ROLE_KEY not configured");
+    return NextResponse.json({ contacts: [], error: "Not configured" }, { status: 200 });
+  }
+
   try {
     const { data, error } = await supabaseAdmin
       .from("wallets")
