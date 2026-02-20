@@ -3,18 +3,12 @@
 import { useState, useEffect, useRef, Suspense } from "react";
 import dynamic from "next/dynamic";
 import { ConnectButton, useAccesly } from "accesly";
-import { createClient } from "@supabase/supabase-js";
 import { TransactionBuilder, Networks, Operation, Asset, Account, Memo } from "@stellar/stellar-sdk";
 
 const GoyoBlob = dynamic(() => import("./GoyoBlob"), { 
   ssr: false,
   loading: () => <div className="w-full h-80" />
 });
-
-const supabase = createClient(
-  "https://gbdlfmkenfldrjnzxqst.supabase.co",
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdiZGxmbWtlbmZsZHJqbnp4cXN0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA0OTU3MTgsImV4cCI6MjA4NjA3MTcxOH0.ymikUupRQrvbtzc7jEF3_ljUT4pmfc0JYG7Raqj9-sU"
-);
 
 let isConversationActive = false;
 let recognition: any = null;
@@ -81,8 +75,13 @@ export default function Home() {
 
   useEffect(() => {
     async function loadContacts() {
-      const { data } = await supabase.from("wallets").select("email, stellar_address").limit(50);
-      if (data && data.length > 0) setContacts(data);
+      try {
+        const res = await fetch("/api/contacts");
+        const { contacts: data } = await res.json();
+        if (data && data.length > 0) setContacts(data);
+      } catch (err) {
+        console.error("Failed to load contacts:", err);
+      }
     }
     loadContacts();
   }, []);
